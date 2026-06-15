@@ -350,18 +350,65 @@ app.get('/api/balances', async (req, res) => {
   }
 });
 
+let cachedSyncedSymbols: string[] = [];
+let cachedSyncedSymbolsTime: number = 0;
+
 app.get('/api/symbols', async (req, res) => {
   try {
+    const now = Date.now();
+    // Cache for 1 hour (3600000 ms)
+    if (cachedSyncedSymbols.length > 0 && now - cachedSyncedSymbolsTime < 3600000) {
+      return res.json({ success: true, symbols: cachedSyncedSymbols, cached: true });
+    }
+
     const exchange = await getExchange();
     await exchange.loadMarkets();
-    const symbols = Object.keys(exchange.markets)
-      .filter(s => s.includes(':USDT') || s.includes(':USD'))
-      .map(s => s.split(':')[0].replace('/', ''));
     
-    // Deduplicate symbols
-    const uniqueSymbols = [...new Set(symbols)].sort();
-    return res.json({ success: true, symbols: uniqueSymbols });
+    // Get Binance tickers for comparison
+    const binance = new ccxt.binance();
+    await binance.loadMarkets();
+    
+    // Fetch tickers from both simultaneously
+    const [deltaTickers, binanceTickers] = await Promise.all([
+       exchange.fetchTickers(),
+       binance.fetchTickers()
+    ]);
+
+    const validSymbols: string[] = [];
+
+    for (const dSymbol of Object.keys(exchange.markets)) {
+       if (dSymbol.includes(':USDT') || dSymbol.includes(':USD')) {
+          const rawBase = dSymbol.split(':')[0]; // e.g. "BTC/USDT" or "BTC/USD"
+          const cleanSymbol = rawBase.replace('/', ''); // e.g. "BTCUSDT" or "BTCUSD"
+          
+          const parts = rawBase.split('/');
+          const baseAsset = parts[0];
+          const binanceSymbol = `${baseAsset}/USDT`; // Normalize to Binance USDT pair
+          
+          const dTicker = deltaTickers[dSymbol];
+          const bTicker = binanceTickers[binanceSymbol];
+          
+          if (dTicker && dTicker.last && bTicker && bTicker.last) {
+              const bPrice = bTicker.last;
+              const dPrice = dTicker.last;
+              const diffPct = Math.abs(bPrice - dPrice) / Math.min(bPrice, dPrice);
+              
+              // Only keep assets where price difference is <= 2%
+              if (diffPct <= 0.02) {
+                 validSymbols.push(cleanSymbol);
+              }
+          }
+       }
+    }
+    
+    // Deduplicate symbols and sort
+    cachedSyncedSymbols = [...new Set(validSymbols)].sort();
+    cachedSyncedSymbolsTime = now;
+    console.log(`[Asset Sync] Synced and verified ${cachedSyncedSymbols.length} assets between Binance and Delta.`);
+    
+    return res.json({ success: true, symbols: cachedSyncedSymbols });
   } catch (error: any) {
+    console.error('[Asset Sync Error]', error.message);
     return res.status(400).json({ success: false, message: formatDeltaError(error) });
   }
 });
@@ -378,9 +425,11 @@ let tradingConfig: any = {
   allocationType: 'fixed',
   orderType: 'market',
   takeProfitPct: '',
-  stopLossPct: ''
+  stopLossPct: '',
+  strategy: 'always_in'
 };
 let lastExecutedCandleTime = 0;
+const binanceUnsupportedSymbols = new Set<string>();
 
 const calculateEmaSeries = (prices: number[], period: number) => {
   const k = 2 / (period + 1);
@@ -423,15 +472,24 @@ const runBotCycle = async () => {
     };
 
     let ohlcv;
-    try {
-      // Delta's CCXT implementation can sometimes return sparse data or limited history on certain pairs.
-      // We will use Binance as our data source to ensure deep liquidity and consistent candle lengths.
-      const binance = new ccxt.binance();
-      const binanceSymbol = tradingConfig.symbol.replace('USD', '/USDT');
-      const limit = Math.max(500, tradingConfig.slowEmaPeriod + 10);
-      ohlcv = await binance.fetchOHLCV(binanceSymbol, tradingConfig.timeframe, undefined, limit);
-    } catch (candleErr: any) {
-      addLog(`Binance Data Error: ${candleErr.message}. Falling back to Delta API...`, 'warn');
+    const binanceSymbol = tradingConfig.symbol.replace('USD', '/USDT');
+    
+    if (!binanceUnsupportedSymbols.has(binanceSymbol)) {
+      try {
+        // Delta's CCXT implementation can sometimes return sparse data or limited history on certain pairs.
+        // We will use Binance as our data source to ensure deep liquidity and consistent candle lengths.
+        const binance = new ccxt.binance();
+        const limit = Math.max(500, tradingConfig.slowEmaPeriod + 10);
+        ohlcv = await binance.fetchOHLCV(binanceSymbol, tradingConfig.timeframe, undefined, limit);
+      } catch (candleErr: any) {
+        if (candleErr.message.toLowerCase().includes('does not have market symbol')) {
+          binanceUnsupportedSymbols.add(binanceSymbol);
+        }
+        console.warn(`Binance Data Error: ${candleErr.message}. Falling back to Delta API...`);
+      }
+    }
+    
+    if (!ohlcv) {
       try {
         const limit = Math.max(500, tradingConfig.slowEmaPeriod + 10);
         ohlcv = await exchange.fetchOHLCV(ccxtSymbol, tradingConfig.timeframe, undefined, limit);
@@ -477,54 +535,89 @@ const runBotCycle = async () => {
     const crossStateStr = isCrossUp ? 'BUY' : isCrossDown ? 'SELL' : 'NONE';
     addLog(`Checked ${tradingConfig.symbol} - Price: ${formatPrice(currentPrice)} | Closed Fast: ${formatPrice(currFast)} | Closed Slow: ${formatPrice(currSlow)}`, 'info');
 
-    if ((isCrossUp || isCrossDown) && closedCandleTime > lastExecutedCandleTime) {
-       addLog(`EMA Cross Detected! FastEMA: ${formatPrice(currFast)}, SlowEMA: ${formatPrice(currSlow)}. Signal: ${crossStateStr}`, 'success');
-       try {
-           // We need to fetch position to see if we need to flip
-           const positions = await exchange.fetchPositions([ccxtSymbol]);
-           const pos = positions.length > 0 ? positions[0] : null;
-           const currentContracts = pos && pos.contracts ? Math.abs(Number(pos.contracts)) : 0;
-           const posSide = pos && pos.side ? String(pos.side).toLowerCase() : undefined;
-           
-           let targetSize = Number(tradingConfig.size || 1);
-           const orderSide = isCrossUp ? 'buy' : 'sell';
-           
-           // Step A: Close previous position if we are in the opposite direction
-           if (currentContracts > 0) {
-               if ((posSide === 'long' || posSide === 'buy') && orderSide === 'sell') {
-                   addLog(`➔ Exiting previous LONG position...`, 'info');
-                   await placeDeltaMarketOrder(tradingConfig.symbol, 'sell', currentContracts, currentPrice, { reduceOnly: true, reduce_only: true });
-               } else if ((posSide === 'short' || posSide === 'sell') && orderSide === 'buy') {
-                   addLog(`➔ Exiting previous SHORT position...`, 'info');
-                   await placeDeltaMarketOrder(tradingConfig.symbol, 'buy', currentContracts, currentPrice, { reduceOnly: true, reduce_only: true });
-               } else {
-                   // We are already in the correct direction
-                   addLog(`Ignored ${crossStateStr} signal because already holding ${posSide} position.`, 'info');
-                   lastExecutedCandleTime = closedCandleTime;
-                   return;
-               }
-           }
-           
-           // Step B: Enter new position
-           addLog(`➔ Entering new ${orderSide.toUpperCase()} position...`, 'info');
-           const result = await placeDeltaMarketOrder(tradingConfig.symbol, orderSide, targetSize, currentPrice);
-           addLog(`➔ Crossover entry placed! Direction: ${orderSide.toUpperCase()} Size: ${targetSize} ID: ${result?.id || 'Success'}`, 'success');
-           lastExecutedCandleTime = closedCandleTime;
-       } catch (err: any) {
-           addLog(`➔ Error placing cross order: ${err.message}`, 'error');
-           if (err.message.includes('ip_not_whitelisted_for_api_key')) {
-               isBotRunning = false;
-               const match = err.message.match(/client_ip":"([^"]+)"/);
-               const ip = match ? match[1] : 'this server';
-               apiAuthError = `Delta Exchange MANDATES IP whitelisting for Trading keys. Since this app runs on a serverless cloud with dynamic IPs (current: ${ip}), connections will be blocked. Alternative: Export this app and run it locally or on a VPS with a static IP.`;
-               addLog(apiAuthError, 'error');
-           } else if (err.message.includes('401') || err.message.includes('invalid_api_key')) {
-               isBotRunning = false;
-               apiAuthError = "Invalid Delta API Credentials. Please check Settings -> Secrets.";
-               addLog('Bot stopped due to invalid API credentials.', 'error');
-           }
-           // Don't update lastExecutedCandleTime so we try again next cycle
-       }
+     if ((isCrossUp || isCrossDown) && closedCandleTime > lastExecutedCandleTime) {
+        addLog(`🔔 EMA Cross Detected! FastEMA: ${formatPrice(currFast)}, SlowEMA: ${formatPrice(currSlow)}. Signal: ${crossStateStr}`, 'success');
+        
+        // ENFORCE MANDATORY STOP LOSS
+        if (!tradingConfig.stopLossPct || parseFloat(tradingConfig.stopLossPct) <= 0) {
+           addLog(`❌ Mandatory Stop Loss is missing! Configure Stop Loss (%) > 0. Bot stopped.`, 'error');
+           isBotRunning = false;
+           return;
+        }
+
+        const orderSide = isCrossUp ? 'buy' : 'sell';
+        let targetSize = Number(tradingConfig.size || 1);
+        const isAlwaysIn = tradingConfig.strategy === 'always_in';
+
+        // ── STEP 1: Check existing position ──
+        let currentContracts = 0;
+        let posSide: string | undefined;
+        try {
+            const positions = await exchange.fetchPositions([ccxtSymbol]);
+            const pos = positions.length > 0 ? positions[0] : null;
+            currentContracts = pos && pos.contracts ? Math.abs(Number(pos.contracts)) : 0;
+            posSide = pos && pos.side ? String(pos.side).toLowerCase() : undefined;
+            addLog(`📊 Position check: ${currentContracts > 0 ? `Holding ${posSide?.toUpperCase()} x${currentContracts}` : 'No open position'}`, 'info');
+        } catch (posErr: any) {
+            addLog(`⚠️ Could not fetch positions: ${posErr.message}. Will attempt trade anyway.`, 'error');
+        }
+
+        // ── STEP 2: If holding same direction, skip ──
+        if (currentContracts > 0) {
+            const isHoldingLong = posSide === 'long' || posSide === 'buy';
+            const isHoldingShort = posSide === 'short' || posSide === 'sell';
+            const isSameDirection = (isHoldingLong && orderSide === 'buy') || (isHoldingShort && orderSide === 'sell');
+
+            if (isSameDirection) {
+                addLog(`⏭️ Ignored ${crossStateStr} signal — already holding ${posSide?.toUpperCase()}.`, 'info');
+                lastExecutedCandleTime = closedCandleTime;
+                return;
+            }
+
+            // ── STEP 3: Close opposite position ──
+            const closingSide = isHoldingLong ? 'sell' : 'buy';
+            addLog(`🔄 Closing existing ${posSide?.toUpperCase()} position (${currentContracts} contracts)...`, 'info');
+            try {
+                await placeDeltaMarketOrder(tradingConfig.symbol, closingSide, currentContracts, currentPrice, { reduceOnly: true, reduce_only: true });
+                addLog(`✅ Closed ${posSide?.toUpperCase()} position successfully.`, 'success');
+            } catch (closeErr: any) {
+                addLog(`❌ Failed to close ${posSide?.toUpperCase()} position: ${closeErr.message}`, 'error');
+                // Don't update lastExecutedCandleTime — retry next cycle
+                return;
+            }
+
+            // If strategy is Standard (close only), stop here
+            if (!isAlwaysIn) {
+                addLog(`📋 Strategy: Standard — closed position, NOT entering new ${orderSide.toUpperCase()}.`, 'info');
+                lastExecutedCandleTime = closedCandleTime;
+                return;
+            }
+
+            // Small delay between close and new entry to let Delta process
+            await new Promise(resolve => setTimeout(resolve, 1500));
+        }
+
+        // ── STEP 4: Enter new position (always_in mode, or fresh entry with no prior position) ──
+        addLog(`🚀 Entering NEW ${orderSide.toUpperCase()} position (Size: ${targetSize}, Strategy: ${isAlwaysIn ? 'Stop & Reverse' : 'Standard'})...`, 'info');
+        try {
+            const result = await placeDeltaMarketOrder(tradingConfig.symbol, orderSide, targetSize, currentPrice);
+            addLog(`✅ ${orderSide.toUpperCase()} entry placed! Order ID: ${result?.id || 'OK'} | Size: ${targetSize}`, 'success');
+            lastExecutedCandleTime = closedCandleTime;
+        } catch (entryErr: any) {
+            addLog(`❌ Failed to enter ${orderSide.toUpperCase()}: ${entryErr.message}`, 'error');
+            if (entryErr.message.includes('ip_not_whitelisted_for_api_key')) {
+                isBotRunning = false;
+                const match = entryErr.message.match(/client_ip":"([^"]+)"/);
+                const ip = match ? match[1] : 'this server';
+                apiAuthError = `Delta Exchange MANDATES IP whitelisting. Current IP: ${ip}. Run locally or on a VPS with static IP.`;
+                addLog(apiAuthError, 'error');
+            } else if (entryErr.message.includes('401') || entryErr.message.includes('invalid_api_key')) {
+                isBotRunning = false;
+                apiAuthError = "Invalid Delta API Credentials. Check .env file.";
+                addLog('Bot stopped due to invalid API credentials.', 'error');
+            }
+            // Don't update lastExecutedCandleTime so we retry next cycle
+        }
     }
   } catch (error: any) {
     addLog(`Error in bot cycle: ${error.message}`, 'error');
@@ -548,7 +641,7 @@ app.get('/api/status', (req, res) => {
 });
 
 app.post('/api/config', (req, res) => {
-  const { symbol, timeframe, fastEmaPeriod, slowEmaPeriod, size, leverage, allocationType, orderType, takeProfitPct, stopLossPct } = req.body;
+  const { symbol, timeframe, fastEmaPeriod, slowEmaPeriod, size, leverage, allocationType, orderType, takeProfitPct, stopLossPct, strategy } = req.body;
   
   if (symbol) tradingConfig.symbol = symbol;
   if (timeframe) tradingConfig.timeframe = timeframe;
@@ -560,10 +653,11 @@ app.post('/api/config', (req, res) => {
   if (orderType !== undefined) tradingConfig.orderType = orderType;
   if (takeProfitPct !== undefined) tradingConfig.takeProfitPct = takeProfitPct;
   if (stopLossPct !== undefined) tradingConfig.stopLossPct = stopLossPct;
+  if (strategy !== undefined) tradingConfig.strategy = strategy;
 
   // reset execution tracking on config change
   lastExecutedCandleTime = 0;
-  addLog(`Configuration updated: ${tradingConfig.symbol} (${tradingConfig.timeframe}) Size: ${tradingConfig.size} (${tradingConfig.allocationType}) Leverage: ${tradingConfig.leverage}x Type: ${tradingConfig.orderType.toUpperCase()}`, 'info');
+  addLog(`Configuration updated: ${tradingConfig.symbol} (${tradingConfig.timeframe}) Size: ${tradingConfig.size} (${tradingConfig.allocationType}) Leverage: ${tradingConfig.leverage}x Type: ${tradingConfig.orderType.toUpperCase()} Strategy: ${tradingConfig.strategy}`, 'info');
   res.json({ success: true, tradingConfig });
 });
 
@@ -600,6 +694,12 @@ app.post('/api/stop', (req, res) => {
 app.post('/api/manual-trade', async (req, res) => {
   const { symbol, side, size, limitPrice } = req.body;
   addLog(`Manual trade requested: ${side} ${symbol} (Size: ${size})...`, "info");
+
+  if (!tradingConfig.stopLossPct || parseFloat(tradingConfig.stopLossPct) <= 0) {
+     const errorMsg = "Mandatory Stop Loss is missing! Please configure Stop Loss (%) first.";
+     addLog(`➔ Error: ${errorMsg}`, "error");
+     return res.status(400).json({ success: false, message: errorMsg });
+  }
   
   try {
     // For manual trade, fetch current price first so bracket TP/SL calculates correctly

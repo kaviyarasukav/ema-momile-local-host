@@ -30,7 +30,8 @@ export default function App() {
       orderType: 'market' as 'market' | 'limit',
       limitPrice: '' as number | string,
       takeProfitPct: '' as number | string,
-      stopLossPct: '' as number | string
+      stopLossPct: '' as number | string,
+      strategy: 'always_in' as 'always_in' | 'standard'
     };
   });
 
@@ -386,6 +387,32 @@ export default function App() {
               <h2 className="text-sm font-medium text-neutral-400 mb-4 uppercase tracking-wider">Engine Control</h2>
               
               <button 
+                onClick={() => updateConfig('strategy', botConfig.strategy === 'always_in' ? 'standard' : 'always_in')}
+                className={`w-full flex items-center justify-between mb-4 py-3 px-4 rounded-lg font-medium transition-all duration-200 border ${
+                  botConfig.strategy === 'always_in'
+                    ? 'bg-blue-500/10 text-blue-400 border-blue-500/30 shadow-[0_0_15px_rgba(59,130,246,0.1)]'
+                    : 'bg-neutral-800 text-neutral-400 border-neutral-700 hover:bg-neutral-700'
+                }`}
+              >
+                <div className="flex flex-col text-left">
+                  <span className="text-sm font-semibold">
+                    {botConfig.strategy === 'always_in' ? '🔄 Stop & Reverse' : '📋 Standard (Close Only)'}
+                  </span>
+                  <span className="text-[10px] opacity-70 font-normal mt-0.5">
+                    {botConfig.strategy === 'always_in' 
+                       ? 'Exit old → Enter new on opposite signal'
+                       : 'Only closes position on opposite signal'}
+                  </span>
+                </div>
+                <div className={`w-11 h-6 rounded-full relative transition-colors ${botConfig.strategy === 'always_in' ? 'bg-blue-500' : 'bg-neutral-600'}`}>
+                  <div 
+                    className="w-5 h-5 rounded-full bg-white absolute top-0.5 transition-all duration-200 shadow-sm"
+                    style={{ left: botConfig.strategy === 'always_in' ? '22px' : '2px' }}
+                  />
+                </div>
+              </button>
+
+              <button 
                 onClick={toggleBot}
                 className={`w-full flex items-center justify-center gap-2 py-3 px-4 rounded-lg font-medium transition-all duration-200 ${
                   isRunning 
@@ -493,30 +520,30 @@ export default function App() {
                   Account Balances
                 </h2>
               </div>
-              <div className="p-4 overflow-x-auto">
-                <table className="w-full text-left text-xs text-neutral-400 whitespace-nowrap">
-                  <thead className="border-b border-neutral-800/80">
+              <div className="p-4 max-h-[350px] overflow-auto">
+                <table className="w-full text-left text-lg whitespace-nowrap">
+                  <thead className="border-b border-neutral-700 bg-neutral-800/40">
                     <tr>
-                      <th className="pb-3 font-medium">Asset</th>
-                      <th className="pb-3 font-medium text-right">Total</th>
-                      <th className="pb-3 font-medium text-right">Free</th>
-                      <th className="pb-3 font-medium text-right">Used</th>
+                      <th className="py-4 px-6 font-semibold text-neutral-300">Asset</th>
+                      <th className="py-4 px-6 font-semibold text-neutral-300 text-right">Total</th>
+                      <th className="py-4 px-6 font-semibold text-neutral-300 text-right">Free</th>
+                      <th className="py-4 px-6 font-semibold text-neutral-300 text-right">Used</th>
                     </tr>
                   </thead>
                   <tbody>
                     {balances.length === 0 ? (
                       <tr>
-                         <td colSpan={4} className="py-6 text-center text-neutral-600">No positive balances available</td>
+                         <td colSpan={4} className="py-12 text-center text-neutral-400 font-medium text-xl">No positive balances available</td>
                       </tr>
                     ) : (
                       balances.map((b, idx) => (
-                        <tr key={idx} className="border-b border-neutral-800/30 last:border-0 hover:bg-neutral-900/20 transition-colors">
-                          <td className="py-2.5 font-medium text-neutral-300">
+                        <tr key={idx} className="border-b border-neutral-800/50 last:border-0 hover:bg-neutral-800/30 transition-colors">
+                          <td className="py-6 px-6 font-bold text-white text-2xl">
                             {b.asset}
                           </td>
-                          <td className="py-2.5 text-neutral-200 text-right font-mono">{Number(b.total).toFixed(8).replace(/\.?0+$/, '') || '0'}</td>
-                          <td className="py-2.5 text-neutral-200 text-right font-mono">{Number(b.free).toFixed(8).replace(/\.?0+$/, '') || '0'}</td>
-                          <td className="py-2.5 text-neutral-200 text-right font-mono">{Number(b.used).toFixed(8).replace(/\.?0+$/, '') || '0'}</td>
+                          <td className="py-6 px-6 text-neutral-100 text-right font-mono text-xl">{Number(b.total).toFixed(8).replace(/\.?0+$/, '') || '0'}</td>
+                          <td className="py-6 px-6 text-neutral-100 text-right font-mono text-xl">{Number(b.free).toFixed(8).replace(/\.?0+$/, '') || '0'}</td>
+                          <td className="py-6 px-6 text-neutral-400 text-right font-mono text-xl">{Number(b.used).toFixed(8).replace(/\.?0+$/, '') || '0'}</td>
                         </tr>
                       ))
                     )}
@@ -532,45 +559,45 @@ export default function App() {
                   Active Positions ({botConfig.symbol})
                 </h2>
               </div>
-              <div className="p-4 overflow-x-auto">
-                <table className="w-full text-left text-xs text-neutral-400 whitespace-nowrap">
-                  <thead className="border-b border-neutral-800/80">
+              <div className="p-4 max-h-[400px] overflow-auto">
+                <table className="w-full text-left text-lg whitespace-nowrap">
+                  <thead className="border-b border-neutral-700 bg-neutral-800/40">
                     <tr>
-                      <th className="pb-3 font-medium">Side</th>
-                      <th className="pb-3 font-medium">Size</th>
-                      <th className="pb-3 font-medium">Entry Price</th>
-                      <th className="pb-3 font-medium">Liq. Price</th>
-                      <th className="pb-3 font-medium">PnL</th>
-                      <th className="pb-3 font-medium text-right">Actions</th>
+                      <th className="py-4 px-6 font-semibold text-neutral-300">Side</th>
+                      <th className="py-4 px-6 font-semibold text-neutral-300">Size</th>
+                      <th className="py-4 px-6 font-semibold text-neutral-300">Entry Price</th>
+                      <th className="py-4 px-6 font-semibold text-neutral-300">Liq. Price</th>
+                      <th className="py-4 px-6 font-semibold text-neutral-300">PnL</th>
+                      <th className="py-4 px-6 font-semibold text-neutral-300 text-right">Actions</th>
                     </tr>
                   </thead>
                   <tbody>
                     {positions.filter(p => Math.abs(Number(p.contracts || 0)) > 0).length === 0 ? (
                       <tr>
-                        <td colSpan={6} className="py-6 text-center text-neutral-600">No active positions for {botConfig.symbol}</td>
+                        <td colSpan={6} className="py-12 text-center text-neutral-400 font-medium text-xl">No active positions for {botConfig.symbol}</td>
                       </tr>
                     ) : (
                       positions.filter(p => Math.abs(Number(p.contracts || 0)) > 0).map((pos, idx) => (
-                        <tr key={idx} className="border-b border-neutral-800/30 last:border-0 hover:bg-neutral-900/20 transition-colors">
-                          <td className={`py-4 font-medium ${pos.side === 'long' || pos.side === 'buy' ? 'text-emerald-500' : 'text-red-500'} uppercase`}>
+                        <tr key={idx} className="border-b border-neutral-800/50 last:border-0 hover:bg-neutral-800/30 transition-colors">
+                          <td className={`py-6 px-6 font-black text-2xl ${pos.side === 'long' || pos.side === 'buy' ? 'text-emerald-400' : 'text-red-400'} uppercase tracking-widest`}>
                             {pos.side}
                           </td>
-                          <td className="py-4 text-neutral-200">{Math.abs(Number(pos.contracts))}</td>
-                          <td className="py-4 text-neutral-200">{Number(pos.entryPrice || 0).toFixed(4).replace(/\.?0+$/, '') || '0'}</td>
-                          <td className="py-4 text-orange-400">{pos.liquidationPrice ? Number(pos.liquidationPrice).toFixed(4).replace(/\.?0+$/, '') : '-'}</td>
-                          <td className="py-4 font-mono">
+                          <td className="py-6 px-6 text-white font-mono text-2xl">{Math.abs(Number(pos.contracts))}</td>
+                          <td className="py-6 px-6 text-white font-mono text-xl">{Number(pos.entryPrice || 0).toFixed(4).replace(/\.?0+$/, '') || '0'}</td>
+                          <td className="py-6 px-6 text-orange-400 font-mono text-xl">{pos.liquidationPrice ? Number(pos.liquidationPrice).toFixed(4).replace(/\.?0+$/, '') : '-'}</td>
+                          <td className="py-6 px-6 font-mono text-2xl font-bold">
                             {pos.info?.realized_pnl ? (
-                              <span className={Number(pos.info.realized_pnl) >= 0 ? 'text-emerald-400' : 'text-red-400'}>
+                              <span className={Number(pos.info.realized_pnl) >= 0 ? 'text-emerald-400 bg-emerald-500/10 px-3 py-2 rounded-lg border border-emerald-500/20 shadow-[0_0_15px_rgba(52,211,153,0.15)]' : 'text-red-400 bg-red-500/10 px-3 py-2 rounded-lg border border-red-500/20 shadow-[0_0_15px_rgba(248,113,113,0.15)]'}>
                                 {Number(pos.info.realized_pnl) > 0 ? '+' : ''}{Number(pos.info.realized_pnl).toFixed(4).replace(/\.?0+$/, '') || '0'}
                               </span>
                             ) : '-'}
                           </td>
-                          <td className="py-4 text-right">
+                          <td className="py-6 px-6 text-right">
                             <button 
                               onClick={() => closePosition(pos.side, Math.abs(Number(pos.contracts)))}
-                              className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded text-xs transition-colors"
+                              className="px-6 py-3 bg-red-500/10 text-red-500 hover:bg-red-500 hover:text-white border border-red-500/20 font-bold rounded-xl text-lg transition-all shadow-sm"
                             >
-                              Close
+                              CLOSE
                             </button>
                           </td>
                         </tr>
