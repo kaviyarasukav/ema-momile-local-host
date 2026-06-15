@@ -1,0 +1,6 @@
+{
+  "name": "Delta Trade Bot",
+  "description": "Trading bot dashboard connecting EMA signals to Delta Exchange.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
